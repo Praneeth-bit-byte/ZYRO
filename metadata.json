@@ -1,0 +1,10 @@
+{
+  "name": "ZYRO — Personal AI Assistant",
+  "description": "JARVIS-inspired personal AI assistant with conversational intelligence, persistent long-term memory, voice interaction (English, Hindi, Telugu), task & workflow automation, and web research.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
