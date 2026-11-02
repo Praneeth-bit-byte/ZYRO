@@ -1,0 +1,26 @@
+# Dependencies & Build Outputs
+node_modules/
+dist/
+build/
+.vite/
+
+# Environment Variables (Never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Firebase & Google Cloud Service Account Credentials
+secrets/
+*.pem
+*.p12
+*.key
+*service-account*.json
+*firebase-adminsdk*.json
+*credentials*.json
+google-application-credentials*.json
+
+# Logs & OS Metadata
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db

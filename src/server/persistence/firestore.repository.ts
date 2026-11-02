@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import type { Firestore } from 'firebase-admin/firestore';
 import {
   UserProfile,
   ConversationRecord,
@@ -8,14 +9,25 @@ import {
   WorkflowRecord,
   AuditLogRecord,
 } from '../../shared/contracts';
-import { getFirebaseConfigurationStatus, getServerConfig } from '../config/env';
+import { getFirebaseConfigurationStatus } from '../config/env';
 import { PersistenceNotConfiguredError, AppError } from '../errors/app-error';
+import { getFirebaseAdminFirestore, isFirebaseAdminConfigured } from './firebase-admin.client';
 import { IDataRepository } from './repository.interface';
 
+let testFirestoreOverride: Firestore | null = null;
+
 /**
- * Cloud Firestore Data Repository Implementation
+ * Allows automated integration tests to inject an isolated Firestore-compatible instance
+ * to verify repository CRUD and cross-user isolation without enabling mock storage in production.
+ */
+export function setFirestoreInstanceForTesting(db: Firestore | null): void {
+  testFirestoreOverride = db;
+}
+
+/**
+ * Cloud Firestore Data Repository Implementation (Firebase Admin SDK)
  *
- * Enforces strict user-scoped document hierarchies:
+ * Enforces strict user-scoped document hierarchies in project `zyro-a3482`:
  *   /users/{userId}
  *   /users/{userId}/conversations/{conversationId}
  *   /users/{userId}/conversations/{conversationId}/messages/{messageId}
@@ -25,207 +37,87 @@ import { IDataRepository } from './repository.interface';
  *   /users/{userId}/auditLogs/{auditId}
  *
  * IMPORTANT ARCHITECTURAL INVARIANT:
- * Does NOT fall back to temporary in-memory arrays or local files.
- * If Firebase credentials are not configured in the environment, methods throw
- * `PersistenceNotConfiguredError` so the system never pretends persistence is active.
+ * - Uses Firebase Admin SDK (`firebase-admin/firestore`) strictly on the backend.
+ * - Never falls back to temporary in-memory arrays or local files in production.
+ * - Enforces explicit UID ownership verification on every read, create, update, and delete operation.
  */
 export class FirestoreRepository implements IDataRepository {
-  private cachedAccessToken: { token: string; expiresAt: number } | null = null;
-
   public isConfigured(): boolean {
-    return getFirebaseConfigurationStatus().configured;
+    if (testFirestoreOverride) {
+      return true;
+    }
+    return isFirebaseAdminConfigured();
   }
 
-  private assertConfigured(): {
-    projectId: string;
-    databaseId: string;
-    clientEmail: string;
-    privateKey: string;
-  } {
+  private getDb(): Firestore {
+    if (testFirestoreOverride) {
+      return testFirestoreOverride;
+    }
     const status = getFirebaseConfigurationStatus();
     if (!status.configured) {
       throw new PersistenceNotConfiguredError(status.missingEnvVars);
     }
-    const cfg = getServerConfig().firebase;
-    return {
-      projectId: cfg.projectId,
-      databaseId: cfg.databaseId,
-      clientEmail: cfg.clientEmail,
-      privateKey: cfg.privateKey,
-    };
+    return getFirebaseAdminFirestore();
   }
 
   private assertValidUserId(userId: string): void {
-    if (!userId || !/^[a-zA-Z0-9_-]{1,128}$/.test(userId)) {
+    if (!userId || typeof userId !== 'string' || !/^[a-zA-Z0-9_.:-]{1,128}$/.test(userId)) {
       throw new AppError({
         statusCode: 400,
         code: 'VALIDATION_ERROR',
-        message: 'Invalid user identifier for user-scoped data operation.',
+        message: 'Invalid user UID for user-scoped Firestore operation.',
       });
     }
   }
 
-  /**
-   * Generates an OAuth2 access token from the configured Firebase service account
-   * using Node's built-in `crypto` module for zero-dependency Google Cloud REST communication.
-   */
-  private async getServiceAccountAccessToken(): Promise<string> {
-    const { clientEmail, privateKey } = this.assertConfigured();
-    const nowSec = Math.floor(Date.now() / 1000);
-
-    if (this.cachedAccessToken && this.cachedAccessToken.expiresAt > nowSec + 60) {
-      return this.cachedAccessToken.token;
-    }
-
-    const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
-    const payload = Buffer.from(
-      JSON.stringify({
-        iss: clientEmail,
-        sub: clientEmail,
-        aud: 'https://oauth2.googleapis.com/token',
-        iat: nowSec,
-        exp: nowSec + 3600,
-        scope: 'https://www.googleapis.com/auth/datastore',
-      })
-    ).toString('base64url');
-
-    const signer = crypto.createSign('RSA-SHA256');
-    signer.update(`${header}.${payload}`);
-    const signature = signer.sign(privateKey, 'base64url');
-    const assertion = `${header}.${payload}.${signature}`;
-
-    const response = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-        assertion,
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
+  private assertValidDocumentId(docId: string, label: string): void {
+    if (!docId || typeof docId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(docId)) {
       throw new AppError({
-        statusCode: 503,
-        code: 'PERSISTENCE_NOT_CONFIGURED',
-        message: `Failed to authenticate with Cloud Firestore using service account credentials: ${errText}`,
+        statusCode: 400,
+        code: 'VALIDATION_ERROR',
+        message: `Invalid ${label} identifier.`,
       });
     }
-
-    const tokenData = (await response.json()) as { access_token: string; expires_in: number };
-    this.cachedAccessToken = {
-      token: tokenData.access_token,
-      expiresAt: nowSec + (tokenData.expires_in || 3600),
-    };
-    return tokenData.access_token;
   }
 
-  private getBaseUrl(): string {
-    const { projectId, databaseId } = this.assertConfigured();
-    return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
-      projectId
-    )}/databases/${encodeURIComponent(databaseId)}/documents`;
-  }
-
-  private toFirestoreValue(val: unknown): Record<string, unknown> {
-    if (val === null || val === undefined) return { nullValue: null };
-    if (typeof val === 'boolean') return { booleanValue: val };
-    if (typeof val === 'number') {
-      return Number.isInteger(val) ? { integerValue: String(val) } : { doubleValue: val };
-    }
-    if (typeof val === 'string') return { stringValue: val };
-    if (Array.isArray(val)) {
-      return { arrayValue: { values: val.map((item) => this.toFirestoreValue(item)) } };
-    }
-    if (typeof val === 'object') {
-      const fields: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
-        if (v !== undefined) {
-          fields[k] = this.toFirestoreValue(v);
-        }
-      }
-      return { mapValue: { fields } };
-    }
-    return { stringValue: String(val) };
-  }
-
-  private fromFirestoreValue(field: any): any {
-    if (!field || typeof field !== 'object') return null;
-    if ('stringValue' in field) return field.stringValue;
-    if ('booleanValue' in field) return field.booleanValue;
-    if ('integerValue' in field) return Number(field.integerValue);
-    if ('doubleValue' in field) return Number(field.doubleValue);
-    if ('nullValue' in field) return null;
-    if ('arrayValue' in field) {
-      return (field.arrayValue?.values || []).map((v: any) => this.fromFirestoreValue(v));
-    }
-    if ('mapValue' in field) {
-      const out: Record<string, any> = {};
-      const fields = field.mapValue?.fields || {};
-      for (const [k, v] of Object.entries(fields)) {
-        out[k] = this.fromFirestoreValue(v);
-      }
-      return out;
-    }
-    return null;
-  }
-
-  private fromFirestoreDocument<T>(doc: any): T {
-    const fields = doc.fields || {};
-    const out: Record<string, any> = {};
-    for (const [k, v] of Object.entries(fields)) {
-      out[k] = this.fromFirestoreValue(v);
-    }
-    if (doc.name && !out.id) {
-      const segments = String(doc.name).split('/');
-      out.id = segments[segments.length - 1];
-    }
-    return out as T;
-  }
-
-  private async requestFirestore(
-    relativePath: string,
-    options: RequestInit = {}
-  ): Promise<any> {
-    const token = await this.getServiceAccountAccessToken();
-    const url = `${this.getBaseUrl()}/${relativePath}`;
-    const res = await fetch(url, {
-      ...options,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        ...(options.headers || {}),
-      },
-    });
-    if (res.status === 404) return null;
-    if (!res.ok) {
-      const text = await res.text();
+  private assertRecordOwnership(recordUserId: unknown, authenticatedUserId: string, label: string): void {
+    if (recordUserId !== authenticatedUserId) {
       throw new AppError({
-        statusCode: res.status,
-        code: 'INTERNAL_ERROR',
-        message: `Firestore operation failed (${res.status}): ${text}`,
+        statusCode: 403,
+        code: 'PERMISSION_DENIED',
+        message: `Access denied: ${label} does not belong to the authenticated user.`,
       });
     }
-    if (res.status === 204) return null;
-    return res.json();
+  }
+
+  private userDocRef(db: Firestore, userId: string) {
+    return db.collection('users').doc(userId);
   }
 
   // --------------------------------------------------------------------------
-  // User Profile Operations
+  // User Profile Operations (/users/{userId})
   // --------------------------------------------------------------------------
   async getUserProfile(userId: string): Promise<UserProfile | null> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
-    const doc = await this.requestFirestore(`users/${encodeURIComponent(userId)}`);
-    if (!doc) return null;
-    return this.fromFirestoreDocument<UserProfile>(doc);
+    const db = this.getDb();
+    const snap = await this.userDocRef(db, userId).get();
+    if (!snap.exists) {
+      return null;
+    }
+    const data = snap.data() as UserProfile | undefined;
+    if (!data) {
+      return null;
+    }
+    this.assertRecordOwnership(data.uid, userId, 'User profile');
+    return data;
   }
 
   async upsertUserProfile(userId: string, profile: Partial<UserProfile>): Promise<UserProfile> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
+    const db = this.getDb();
     const existing = await this.getUserProfile(userId);
     const now = new Date().toISOString();
+
     const merged: UserProfile = {
       uid: userId,
       email: profile.email ?? existing?.email ?? null,
@@ -240,39 +132,38 @@ export class FirestoreRepository implements IDataRepository {
       updatedAt: now,
     };
 
-    const encoded = this.toFirestoreValue(merged).mapValue as { fields: Record<string, unknown> };
-    const saved = await this.requestFirestore(`users/${encodeURIComponent(userId)}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ fields: encoded.fields }),
-    });
-    return this.fromFirestoreDocument<UserProfile>(saved);
+    await this.userDocRef(db, userId).set(merged, { merge: true });
+    return merged;
   }
 
   // --------------------------------------------------------------------------
-  // Conversations & Messages (User-Scoped)
+  // Conversations & Messages (/users/{userId}/conversations/{conversationId}/messages/{messageId})
   // --------------------------------------------------------------------------
   async listConversations(userId: string): Promise<ConversationRecord[]> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
-    const data = await this.requestFirestore(
-      `users/${encodeURIComponent(userId)}/conversations`
-    );
-    const docs = data?.documents || [];
-    return docs
-      .map((d: any) => this.fromFirestoreDocument<ConversationRecord>(d))
-      .sort((a: ConversationRecord, b: ConversationRecord) =>
-        b.updatedAt.localeCompare(a.updatedAt)
-      );
+    const db = this.getDb();
+    const snap = await this.userDocRef(db, userId).collection('conversations').get();
+    const records: ConversationRecord[] = [];
+
+    for (const doc of snap.docs) {
+      const data = doc.data() as ConversationRecord;
+      if (data && data.userId === userId) {
+        records.push({ ...data, id: data.id || doc.id });
+      }
+    }
+
+    return records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
   async createConversation(
     userId: string,
     data: Omit<ConversationRecord, 'id' | 'userId' | 'createdAt' | 'updatedAt'>
   ): Promise<ConversationRecord> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
-    const id = `conv-${Date.now()}-${ crypto.randomBytes(3).toString('hex')}`;
+    const db = this.getDb();
+    const id = `conv-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
     const now = new Date().toISOString();
+
     const record: ConversationRecord = {
       id,
       userId,
@@ -282,37 +173,62 @@ export class FirestoreRepository implements IDataRepository {
       createdAt: now,
       updatedAt: now,
     };
-    const encoded = this.toFirestoreValue(record).mapValue as { fields: Record<string, unknown> };
-    await this.requestFirestore(
-      `users/${encodeURIComponent(userId)}/conversations?documentId=${encodeURIComponent(id)}`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ fields: encoded.fields }),
-      }
-    );
+
+    await this.userDocRef(db, userId).collection('conversations').doc(id).set(record);
     return record;
   }
 
   async listMessages(userId: string, conversationId: string): Promise<MessageRecord[]> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
-    const data = await this.requestFirestore(
-      `users/${encodeURIComponent(userId)}/conversations/${encodeURIComponent(
-        conversationId
-      )}/messages`
-    );
-    const docs = data?.documents || [];
-    return docs
-      .map((d: any) => this.fromFirestoreDocument<MessageRecord>(d))
-      .sort((a: MessageRecord, b: MessageRecord) => a.createdAt.localeCompare(b.createdAt));
+    this.assertValidDocumentId(conversationId, 'conversation');
+    const db = this.getDb();
+
+    const convRef = this.userDocRef(db, userId).collection('conversations').doc(conversationId);
+    const convSnap = await convRef.get();
+    if (!convSnap.exists) {
+      throw new AppError({
+        statusCode: 404,
+        code: 'NOT_FOUND',
+        message: `Conversation "${conversationId}" not found for the authenticated user.`,
+      });
+    }
+    const convData = convSnap.data() as ConversationRecord | undefined;
+    this.assertRecordOwnership(convData?.userId, userId, 'Conversation');
+
+    const msgSnap = await convRef.collection('messages').get();
+    const messages: MessageRecord[] = [];
+    for (const doc of msgSnap.docs) {
+      const data = doc.data() as MessageRecord;
+      if (data && data.userId === userId) {
+        messages.push({ ...data, id: data.id || doc.id });
+      }
+    }
+
+    return messages.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   async appendMessage(
     userId: string,
     data: Omit<MessageRecord, 'id' | 'userId' | 'createdAt'>
   ): Promise<MessageRecord> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
+    this.assertValidDocumentId(data.conversationId, 'conversation');
+    const db = this.getDb();
+
+    const convRef = this.userDocRef(db, userId)
+      .collection('conversations')
+      .doc(data.conversationId);
+    const convSnap = await convRef.get();
+    if (!convSnap.exists) {
+      throw new AppError({
+        statusCode: 404,
+        code: 'NOT_FOUND',
+        message: `Conversation "${data.conversationId}" not found for the authenticated user.`,
+      });
+    }
+    const convData = convSnap.data() as ConversationRecord | undefined;
+    this.assertRecordOwnership(convData?.userId, userId, 'Conversation');
+
     const id = `msg-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
     const now = new Date().toISOString();
     const record: MessageRecord = {
@@ -321,115 +237,121 @@ export class FirestoreRepository implements IDataRepository {
       conversationId: data.conversationId,
       role: data.role,
       content: data.content,
-      modelUsed: data.modelUsed,
+      ...(data.modelUsed ? { modelUsed: data.modelUsed } : {}),
       locale: data.locale,
       createdAt: now,
     };
-    const encoded = this.toFirestoreValue(record).mapValue as { fields: Record<string, unknown> };
-    await this.requestFirestore(
-      `users/${encodeURIComponent(userId)}/conversations/${encodeURIComponent(
-        data.conversationId
-      )}/messages?documentId=${encodeURIComponent(id)}`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ fields: encoded.fields }),
-      }
-    );
+
+    await convRef.collection('messages').doc(id).set(record);
+    await convRef.set({ updatedAt: now }, { merge: true });
     return record;
   }
 
   // --------------------------------------------------------------------------
-  // Long-Term Memories (User-Scoped)
+  // Long-Term Memories (/users/{userId}/memories/{memoryId})
   // --------------------------------------------------------------------------
   async listMemories(userId: string): Promise<MemoryRecord[]> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
-    const data = await this.requestFirestore(`users/${encodeURIComponent(userId)}/memories`);
-    const docs = data?.documents || [];
-    return docs
-      .map((d: any) => this.fromFirestoreDocument<MemoryRecord>(d))
-      .sort((a: MemoryRecord, b: MemoryRecord) => b.createdAt.localeCompare(a.createdAt));
+    const db = this.getDb();
+    const snap = await this.userDocRef(db, userId).collection('memories').get();
+    const memories: MemoryRecord[] = [];
+
+    for (const doc of snap.docs) {
+      const data = doc.data() as MemoryRecord;
+      if (data && data.userId === userId) {
+        memories.push({ ...data, id: data.id || doc.id });
+      }
+    }
+
+    return memories.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   async createMemory(
     userId: string,
     data: Omit<MemoryRecord, 'id' | 'userId' | 'createdAt' | 'updatedAt'>
   ): Promise<MemoryRecord> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
+    const db = this.getDb();
     const id = `mem-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
     const now = new Date().toISOString();
+
     const record: MemoryRecord = {
       id,
       userId,
       category: data.category,
       content: data.content,
-      tags: data.tags,
+      tags: Array.isArray(data.tags) ? data.tags : [],
       source: data.source,
       createdAt: now,
       updatedAt: now,
     };
-    const encoded = this.toFirestoreValue(record).mapValue as { fields: Record<string, unknown> };
-    await this.requestFirestore(
-      `users/${encodeURIComponent(userId)}/memories?documentId=${encodeURIComponent(id)}`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ fields: encoded.fields }),
-      }
-    );
+
+    await this.userDocRef(db, userId).collection('memories').doc(id).set(record);
     return record;
   }
 
   async deleteMemory(userId: string, memoryId: string): Promise<void> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
-    await this.requestFirestore(
-      `users/${encodeURIComponent(userId)}/memories/${encodeURIComponent(memoryId)}`,
-      { method: 'DELETE' }
-    );
+    this.assertValidDocumentId(memoryId, 'memory');
+    const db = this.getDb();
+
+    const memRef = this.userDocRef(db, userId).collection('memories').doc(memoryId);
+    const snap = await memRef.get();
+    if (!snap.exists) {
+      throw new AppError({
+        statusCode: 404,
+        code: 'NOT_FOUND',
+        message: `Memory "${memoryId}" not found for the authenticated user.`,
+      });
+    }
+    const existing = snap.data() as MemoryRecord | undefined;
+    this.assertRecordOwnership(existing?.userId, userId, 'Memory');
+
+    await memRef.delete();
   }
 
   // --------------------------------------------------------------------------
-  // Tasks (User-Scoped)
+  // Tasks (/users/{userId}/tasks/{taskId})
   // --------------------------------------------------------------------------
   async listTasks(userId: string): Promise<TaskRecord[]> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
-    const data = await this.requestFirestore(`users/${encodeURIComponent(userId)}/tasks`);
-    const docs = data?.documents || [];
-    return docs
-      .map((d: any) => this.fromFirestoreDocument<TaskRecord>(d))
-      .sort((a: TaskRecord, b: TaskRecord) => b.createdAt.localeCompare(a.createdAt));
+    const db = this.getDb();
+    const snap = await this.userDocRef(db, userId).collection('tasks').get();
+    const tasks: TaskRecord[] = [];
+
+    for (const doc of snap.docs) {
+      const data = doc.data() as TaskRecord;
+      if (data && data.userId === userId) {
+        tasks.push({ ...data, id: data.id || doc.id });
+      }
+    }
+
+    return tasks.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   async createTask(
     userId: string,
     data: Omit<TaskRecord, 'id' | 'userId' | 'createdAt' | 'updatedAt'>
   ): Promise<TaskRecord> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
+    const db = this.getDb();
     const id = `task-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
     const now = new Date().toISOString();
+
     const record: TaskRecord = {
       id,
       userId,
       title: data.title,
-      description: data.description,
+      ...(data.description !== undefined ? { description: data.description } : {}),
       category: data.category,
       priority: data.priority,
       status: data.status,
-      dueDate: data.dueDate,
+      ...(data.dueDate !== undefined ? { dueDate: data.dueDate } : {}),
       createdAt: now,
       updatedAt: now,
     };
-    const encoded = this.toFirestoreValue(record).mapValue as { fields: Record<string, unknown> };
-    await this.requestFirestore(
-      `users/${encodeURIComponent(userId)}/tasks?documentId=${encodeURIComponent(id)}`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ fields: encoded.fields }),
-      }
-    );
+
+    await this.userDocRef(db, userId).collection('tasks').doc(id).set(record);
     return record;
   }
 
@@ -438,59 +360,83 @@ export class FirestoreRepository implements IDataRepository {
     taskId: string,
     status: TaskRecord['status']
   ): Promise<TaskRecord> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
-    const docPath = `users/${encodeURIComponent(userId)}/tasks/${encodeURIComponent(taskId)}`;
-    const existingDoc = await this.requestFirestore(docPath);
-    if (!existingDoc) {
+    this.assertValidDocumentId(taskId, 'task');
+    const db = this.getDb();
+
+    const taskRef = this.userDocRef(db, userId).collection('tasks').doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) {
       throw new AppError({
         statusCode: 404,
         code: 'NOT_FOUND',
-        message: `Task "${taskId}" not found.`,
+        message: `Task "${taskId}" not found for the authenticated user.`,
       });
     }
-    const existing = this.fromFirestoreDocument<TaskRecord>(existingDoc);
+
+    const existing = snap.data() as TaskRecord;
+    this.assertRecordOwnership(existing.userId, userId, 'Task');
+
     const updated: TaskRecord = {
       ...existing,
+      id: existing.id || taskId,
       status,
       updatedAt: new Date().toISOString(),
     };
-    const encoded = this.toFirestoreValue(updated).mapValue as { fields: Record<string, unknown> };
-    await this.requestFirestore(docPath, {
-      method: 'PATCH',
-      body: JSON.stringify({ fields: encoded.fields }),
-    });
+
+    await taskRef.set(updated);
     return updated;
   }
 
   async deleteTask(userId: string, taskId: string): Promise<void> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
-    await this.requestFirestore(
-      `users/${encodeURIComponent(userId)}/tasks/${encodeURIComponent(taskId)}`,
-      { method: 'DELETE' }
-    );
+    this.assertValidDocumentId(taskId, 'task');
+    const db = this.getDb();
+
+    const taskRef = this.userDocRef(db, userId).collection('tasks').doc(taskId);
+    const snap = await taskRef.get();
+    if (!snap.exists) {
+      throw new AppError({
+        statusCode: 404,
+        code: 'NOT_FOUND',
+        message: `Task "${taskId}" not found for the authenticated user.`,
+      });
+    }
+
+    const existing = snap.data() as TaskRecord | undefined;
+    this.assertRecordOwnership(existing?.userId, userId, 'Task');
+
+    await taskRef.delete();
   }
 
   // --------------------------------------------------------------------------
-  // Workflows (User-Scoped)
+  // Workflows (/users/{userId}/workflows/{workflowId})
   // --------------------------------------------------------------------------
   async listWorkflows(userId: string): Promise<WorkflowRecord[]> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
-    const data = await this.requestFirestore(`users/${encodeURIComponent(userId)}/workflows`);
-    const docs = data?.documents || [];
-    return docs.map((d: any) => this.fromFirestoreDocument<WorkflowRecord>(d));
+    const db = this.getDb();
+    const snap = await this.userDocRef(db, userId).collection('workflows').get();
+    const workflows: WorkflowRecord[] = [];
+
+    for (const doc of snap.docs) {
+      const data = doc.data() as WorkflowRecord;
+      if (data && data.userId === userId) {
+        workflows.push({ ...data, id: data.id || doc.id });
+      }
+    }
+
+    return workflows;
   }
 
   async createWorkflow(
     userId: string,
     data: Omit<WorkflowRecord, 'id' | 'userId' | 'createdAt' | 'updatedAt' | 'lastRunAt'>
   ): Promise<WorkflowRecord> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
+    const db = this.getDb();
     const id = `wf-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
     const now = new Date().toISOString();
+
     const record: WorkflowRecord = {
       id,
       userId,
@@ -503,53 +449,47 @@ export class FirestoreRepository implements IDataRepository {
       createdAt: now,
       updatedAt: now,
     };
-    const encoded = this.toFirestoreValue(record).mapValue as { fields: Record<string, unknown> };
-    await this.requestFirestore(
-      `users/${encodeURIComponent(userId)}/workflows?documentId=${encodeURIComponent(id)}`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ fields: encoded.fields }),
-      }
-    );
+
+    await this.userDocRef(db, userId).collection('workflows').doc(id).set(record);
     return record;
   }
 
   // --------------------------------------------------------------------------
-  // Audit Logs (User-Scoped)
+  // Audit Logs (/users/{userId}/auditLogs/{auditId})
   // --------------------------------------------------------------------------
   async listAuditLogs(userId: string, limit = 50): Promise<AuditLogRecord[]> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
-    const data = await this.requestFirestore(`users/${encodeURIComponent(userId)}/auditLogs`);
-    const docs = data?.documents || [];
-    return docs
-      .map((d: any) => this.fromFirestoreDocument<AuditLogRecord>(d))
-      .sort((a: AuditLogRecord, b: AuditLogRecord) => b.timestamp.localeCompare(a.timestamp))
-      .slice(0, limit);
+    const db = this.getDb();
+    const snap = await this.userDocRef(db, userId).collection('auditLogs').get();
+    const logs: AuditLogRecord[] = [];
+
+    for (const doc of snap.docs) {
+      const data = doc.data() as AuditLogRecord;
+      if (data && data.userId === userId) {
+        logs.push({ ...data, id: data.id || doc.id });
+      }
+    }
+
+    return logs.sort((a, b) => b.timestamp.localeCompare(a.timestamp)).slice(0, limit);
   }
 
   async appendAuditLog(
     userId: string,
     entry: Omit<AuditLogRecord, 'id' | 'userId' | 'timestamp'>
   ): Promise<AuditLogRecord> {
-    this.assertConfigured();
     this.assertValidUserId(userId);
+    const db = this.getDb();
     const id = `audit-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
     const timestamp = new Date().toISOString();
+
     const record: AuditLogRecord = {
       id,
       userId,
       ...entry,
       timestamp,
     };
-    const encoded = this.toFirestoreValue(record).mapValue as { fields: Record<string, unknown> };
-    await this.requestFirestore(
-      `users/${encodeURIComponent(userId)}/auditLogs?documentId=${encodeURIComponent(id)}`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ fields: encoded.fields }),
-      }
-    );
+
+    await this.userDocRef(db, userId).collection('auditLogs').doc(id).set(record);
     return record;
   }
 }

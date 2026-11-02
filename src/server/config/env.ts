@@ -1,10 +1,15 @@
+import fs from 'fs';
+import path from 'path';
 import { PersistenceConfigurationStatus } from '../../shared/contracts';
 
 /**
  * Server-Side Environment & Model Configuration
- * Centralizes environment variables and validates configured Google AI model IDs.
+ * Centralizes environment variables, validates configured Google AI model IDs,
+ * and resolves server-side Firebase Admin credentials for project `zyro-a3482`.
  * Never imported by client code.
  */
+
+export const DEFAULT_FIREBASE_PROJECT_ID = 'zyro-a3482';
 
 export const SUPPORTED_GOOGLE_AI_MODELS: ReadonlySet<string> = new Set([
   'gemini-3.8-flash',
@@ -64,6 +69,23 @@ export function validateModelId(modelId: string): ModelValidationStatus {
   };
 }
 
+export type FirebaseCredentialSource =
+  | 'google_application_credentials_file'
+  | 'service_account_json_env'
+  | 'discrete_env_vars'
+  | 'unconfigured';
+
+export interface ResolvedFirebaseCredentials {
+  source: FirebaseCredentialSource;
+  projectId: string;
+  databaseId: string;
+  clientEmail: string;
+  privateKey: string;
+  credentialsFilePath: string | null;
+  webApiKey: string;
+  configurationError?: string;
+}
+
 export interface ServerConfig {
   port: number;
   geminiApiKey: string;
@@ -74,12 +96,165 @@ export interface ServerConfig {
     tts: string;
     transcribe: string;
   };
-  firebase: {
-    projectId: string;
-    databaseId: string;
-    clientEmail: string;
-    privateKey: string;
-    webApiKey: string;
+  firebase: ResolvedFirebaseCredentials;
+}
+
+function resolveFirebaseCredentials(): ResolvedFirebaseCredentials {
+  const configuredProjectId = (
+    process.env.FIREBASE_PROJECT_ID ||
+    process.env.GOOGLE_CLOUD_PROJECT ||
+    process.env.GCLOUD_PROJECT ||
+    process.env.VITE_FIREBASE_PROJECT_ID ||
+    DEFAULT_FIREBASE_PROJECT_ID
+  ).trim();
+
+  const databaseId = (process.env.FIREBASE_DATABASE_ID || '(default)').trim();
+  const webApiKey = (process.env.VITE_FIREBASE_API_KEY || '').trim();
+  const gacPathRaw = (process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim();
+  const rawServiceAccountJson = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
+  const envClientEmail = (process.env.FIREBASE_CLIENT_EMAIL || '').trim();
+  const envPrivateKey = (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n').trim();
+
+  // 1. Priority 1: GOOGLE_APPLICATION_CREDENTIALS file path
+  if (gacPathRaw) {
+    const resolvedPath = path.isAbsolute(gacPathRaw)
+      ? gacPathRaw
+      : path.resolve(process.cwd(), gacPathRaw);
+
+    if (!fs.existsSync(resolvedPath)) {
+      return {
+        source: 'unconfigured',
+        projectId: configuredProjectId,
+        databaseId,
+        clientEmail: '',
+        privateKey: '',
+        credentialsFilePath: resolvedPath,
+        webApiKey,
+        configurationError: `GOOGLE_APPLICATION_CREDENTIALS points to a non-existent file ("${gacPathRaw}").`,
+      };
+    }
+
+    try {
+      const fileContent = fs.readFileSync(resolvedPath, 'utf8');
+      const parsed = JSON.parse(fileContent) as {
+        project_id?: string;
+        client_email?: string;
+        private_key?: string;
+      };
+
+      const clientEmail = (parsed.client_email || '').trim();
+      const privateKey = (parsed.private_key || '').replace(/\\n/g, '\n').trim();
+      const projectId = configuredProjectId || (parsed.project_id || '').trim() || DEFAULT_FIREBASE_PROJECT_ID;
+
+      if (!clientEmail || !privateKey) {
+        return {
+          source: 'unconfigured',
+          projectId,
+          databaseId,
+          clientEmail: '',
+          privateKey: '',
+          credentialsFilePath: resolvedPath,
+          webApiKey,
+          configurationError:
+            'The GOOGLE_APPLICATION_CREDENTIALS JSON file is missing required "client_email" or "private_key" fields.',
+        };
+      }
+
+      return {
+        source: 'google_application_credentials_file',
+        projectId,
+        databaseId,
+        clientEmail,
+        privateKey,
+        credentialsFilePath: resolvedPath,
+        webApiKey,
+      };
+    } catch (err: any) {
+      return {
+        source: 'unconfigured',
+        projectId: configuredProjectId,
+        databaseId,
+        clientEmail: '',
+        privateKey: '',
+        credentialsFilePath: resolvedPath,
+        webApiKey,
+        configurationError: `Failed to parse GOOGLE_APPLICATION_CREDENTIALS JSON file: ${
+          err?.message || 'Invalid JSON'
+        }`,
+      };
+    }
+  }
+
+  // 2. Priority 2: FIREBASE_SERVICE_ACCOUNT_JSON environment variable (hosting secrets)
+  if (rawServiceAccountJson) {
+    try {
+      const parsed = JSON.parse(rawServiceAccountJson) as {
+        project_id?: string;
+        client_email?: string;
+        private_key?: string;
+      };
+      const clientEmail = (parsed.client_email || '').trim();
+      const privateKey = (parsed.private_key || '').replace(/\\n/g, '\n').trim();
+      const projectId = configuredProjectId || (parsed.project_id || '').trim() || DEFAULT_FIREBASE_PROJECT_ID;
+
+      if (!clientEmail || !privateKey) {
+        return {
+          source: 'unconfigured',
+          projectId,
+          databaseId,
+          clientEmail: '',
+          privateKey: '',
+          credentialsFilePath: null,
+          webApiKey,
+          configurationError:
+            'FIREBASE_SERVICE_ACCOUNT_JSON is missing required "client_email" or "private_key" fields.',
+        };
+      }
+
+      return {
+        source: 'service_account_json_env',
+        projectId,
+        databaseId,
+        clientEmail,
+        privateKey,
+        credentialsFilePath: null,
+        webApiKey,
+      };
+    } catch {
+      return {
+        source: 'unconfigured',
+        projectId: configuredProjectId,
+        databaseId,
+        clientEmail: '',
+        privateKey: '',
+        credentialsFilePath: null,
+        webApiKey,
+        configurationError: 'FIREBASE_SERVICE_ACCOUNT_JSON does not contain valid JSON.',
+      };
+    }
+  }
+
+  // 3. Priority 3: Discrete FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY environment variables
+  if (envClientEmail && envPrivateKey) {
+    return {
+      source: 'discrete_env_vars',
+      projectId: configuredProjectId,
+      databaseId,
+      clientEmail: envClientEmail,
+      privateKey: envPrivateKey,
+      credentialsFilePath: null,
+      webApiKey,
+    };
+  }
+
+  return {
+    source: 'unconfigured',
+    projectId: configuredProjectId,
+    databaseId,
+    clientEmail: envClientEmail,
+    privateKey: envPrivateKey,
+    credentialsFilePath: null,
+    webApiKey,
   };
 }
 
@@ -94,40 +269,29 @@ export function getServerConfig(): ServerConfig {
       tts: (process.env.ZYRO_TTS_MODEL || 'gemini-3.8-flash-lite-tts').trim(),
       transcribe: (process.env.ZYRO_TRANSCRIBE_MODEL || 'gemini-3.5-transcribe').trim(),
     },
-    firebase: {
-      projectId: (
-        process.env.FIREBASE_PROJECT_ID ||
-        process.env.VITE_FIREBASE_PROJECT_ID ||
-        ''
-      ).trim(),
-      databaseId: (process.env.FIREBASE_DATABASE_ID || '(default)').trim(),
-      clientEmail: (process.env.FIREBASE_CLIENT_EMAIL || '').trim(),
-      privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n').trim(),
-      webApiKey: (process.env.VITE_FIREBASE_API_KEY || '').trim(),
-    },
+    firebase: resolveFirebaseCredentials(),
   };
 }
 
 export function getFirebaseConfigurationStatus(): PersistenceConfigurationStatus {
   const cfg = getServerConfig().firebase;
+  const configured = cfg.source !== 'unconfigured' && Boolean(cfg.projectId && cfg.clientEmail && cfg.privateKey);
+
   const missingEnvVars: string[] = [];
-
-  if (!cfg.projectId) missingEnvVars.push('FIREBASE_PROJECT_ID');
-  if (!cfg.clientEmail) missingEnvVars.push('FIREBASE_CLIENT_EMAIL');
-  if (!cfg.privateKey) missingEnvVars.push('FIREBASE_PRIVATE_KEY');
-
-  const configured = missingEnvVars.length === 0;
+  if (!configured) {
+    missingEnvVars.push('GOOGLE_APPLICATION_CREDENTIALS');
+  }
 
   return {
     provider: 'firebase-firestore',
     configured,
-    projectId: cfg.projectId || null,
+    projectId: cfg.projectId || DEFAULT_FIREBASE_PROJECT_ID,
     databaseId: cfg.databaseId,
     missingEnvVars,
     message: configured
-      ? `Connected to Cloud Firestore project "${cfg.projectId}" (${cfg.databaseId}).`
-      : `Persistence not configured. Set ${missingEnvVars.join(
-          ', '
-        )} in environment variables to enable Cloud Firestore storage.`,
+      ? `Firebase Admin initialized for project "${cfg.projectId}" (database: ${cfg.databaseId}).`
+      : cfg.configurationError
+      ? `Persistence not configured for project "${cfg.projectId}": ${cfg.configurationError}`
+      : `Persistence not configured for project "${cfg.projectId}". Set GOOGLE_APPLICATION_CREDENTIALS (or FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY) on the server to enable Cloud Firestore persistence.`,
   };
 }

@@ -55,7 +55,7 @@ export class OrchestratorService {
       }
     } else if (!dataRepository.isConfigured()) {
       persistenceNotice =
-        'Persistence not configured. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY to store conversation history and memories in Cloud Firestore.';
+        'Persistence not configured for project "zyro-a3482". Set GOOGLE_APPLICATION_CREDENTIALS (or FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY) on the server to store conversation history and memories in Cloud Firestore.';
     } else if (!userId) {
       persistenceNotice =
         'Unauthenticated session. Sign in with Firebase Authentication to persist conversation history and personal memories.';

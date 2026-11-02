@@ -97,7 +97,7 @@ The project will be developed incrementally, with a modular architecture that al
 
 ## Technical Direction
 
-ZYRO will use a modular architecture with independently maintainable components.
+ZYRO uses a modular architecture with independently maintainable components.
 
 | Component | Planned Responsibility |
 |---|---|
@@ -110,7 +110,86 @@ ZYRO will use a modular architecture with independently maintainable components.
 | Automation engine | Scheduled and multi-step workflows |
 | Security layer | Permissions, credential protection, and action verification |
 
-The technology stack will be finalized during the initial architecture phase. Components should be selected for reliability, maintainability, performance, and extensibility.
+---
+
+## Firebase Authentication & Cloud Firestore Setup (`zyro-a3482`)
+
+ZYRO uses the **Firebase Admin SDK (`firebase-admin`) strictly on the backend** to verify Firebase ID tokens and persist user-scoped data in Cloud Firestore under project **`zyro-a3482`**. Service-account credentials are never exposed to the frontend.
+
+### User-Scoped Firestore Data Hierarchy
+All persistent records are isolated under the authenticated user's UID:
+- `/users/{uid}` — User profile and cross-platform preferences
+- `/users/{uid}/conversations/{conversationId}` — Conversation metadata
+- `/users/{uid}/conversations/{conversationId}/messages/{messageId}` — Conversation message history
+- `/users/{uid}/memories/{memoryId}` — Long-term personal, project, and preference memories
+- `/users/{uid}/tasks/{taskId}` — User tasks and status tracking
+- `/users/{uid}/workflows/{workflowId}` — Multi-step automation workflows
+- `/users/{uid}/auditLogs/{auditId}` — Permission Gateway execution and security audit trail
+
+### 1. Local Development Setup (`GOOGLE_APPLICATION_CREDENTIALS`)
+
+1. Open the [Firebase Console for project `zyro-a3482`](https://console.firebase.google.com/project/zyro-a3482/settings/serviceaccounts/adminsdk).
+2. Navigate to **Project Settings $\rightarrow$ Service accounts $\rightarrow$ Firebase Admin SDK** and click **Generate new private key**.
+3. Save the downloaded JSON file into the local, git-ignored `secrets/` directory (never commit this file to version control):
+   ```bash
+   mkdir -p secrets
+   mv ~/Downloads/zyro-a3482-firebase-adminsdk-*.json ./secrets/zyro-a3482-service-account.json
+   chmod 600 ./secrets/zyro-a3482-service-account.json
+   ```
+4. Copy `.env.example` to `.env` and set your environment variables:
+   ```bash
+   cp .env.example .env
+   ```
+   In `.env`:
+   ```env
+   GEMINI_API_KEY=<your-google-ai-api-key>
+   FIREBASE_PROJECT_ID=zyro-a3482
+   FIREBASE_DATABASE_ID=(default)
+   GOOGLE_APPLICATION_CREDENTIALS=./secrets/zyro-a3482-service-account.json
+   ```
+5. Install dependencies and start the server:
+   ```bash
+   npm install
+   npm run dev
+   ```
+6. Verify connection status:
+   ```bash
+   curl -s http://127.0.0.1:3000/api/v1/system/status | jq .persistence
+   ```
+   When configured, `persistence.configured` returns `true` with `projectId: "zyro-a3482"`.
+
+### 2. Cloud / Production Deployment Setup
+
+When deploying to Cloud Run, Docker, or another secure hosting environment where local credential files are not used, configure environment secrets via your platform's Secret Manager:
+
+- **Option A — Inline JSON Secret (`FIREBASE_SERVICE_ACCOUNT_JSON`):**
+  Mount the full service-account JSON content into `FIREBASE_SERVICE_ACCOUNT_JSON` and set `FIREBASE_PROJECT_ID=zyro-a3482`.
+- **Option B — Discrete Environment Variables:**
+  Set `FIREBASE_PROJECT_ID=zyro-a3482`, `FIREBASE_CLIENT_EMAIL`, and `FIREBASE_PRIVATE_KEY` in your hosting secret store.
+
+### 3. Verifying Authenticated Requests Against Protected Endpoints
+
+Obtain a Firebase ID token `<FIREBASE_ID_TOKEN>` for a signed-in user in project `zyro-a3482` and pass it in the `Authorization: Bearer <FIREBASE_ID_TOKEN>` header:
+
+```bash
+# Create a user-scoped memory
+curl -X POST http://127.0.0.1:3000/api/v1/memories \
+  -H "Authorization: Bearer <FIREBASE_ID_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"category":"Project Context","content":"Primary Firebase project is zyro-a3482","tags":["firebase","architecture"]}'
+
+# List user-scoped memories
+curl -H "Authorization: Bearer <FIREBASE_ID_TOKEN>" \
+  http://127.0.0.1:3000/api/v1/memories
+
+# Create a user-scoped task
+curl -X POST http://127.0.0.1:3000/api/v1/tasks \
+  -H "Authorization: Bearer <FIREBASE_ID_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Review Firestore security rules","priority":"High","category":"Security"}'
+```
+
+---
 
 ## Development Roadmap
 

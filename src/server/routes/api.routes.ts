@@ -31,7 +31,7 @@ apiRouter.get(
 
       res.json({
         service: 'ZYRO Core Backend',
-        version: '0.1.1-milestone1.1',
+        version: '0.1.2-firebase-admin',
         timestamp: new Date().toISOString(),
         ai: aiDiag,
         persistence: fbDiag,
@@ -114,9 +114,10 @@ apiRouter.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const fbDiag = getFirebaseConfigurationStatus();
-      if (!fbDiag.configured || !req.userContext) {
+      const isConfigured = dataRepository.isConfigured();
+      if (!isConfigured || !req.userContext) {
         res.json({
-          configured: fbDiag.configured,
+          configured: isConfigured,
           conversations: [],
           persistence: fbDiag,
         });
@@ -128,6 +129,29 @@ apiRouter.get(
         conversations,
         persistence: fbDiag,
       });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+apiRouter.post(
+  '/conversations',
+  requireUserScopedAuth,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const uid = req.userContext!.uid;
+      const { title, platformOrigin = 'web', locale = 'en-US' } = req.body;
+      if (!title || typeof title !== 'string' || !title.trim()) {
+        throw new ValidationError('Conversation title is required.');
+      }
+
+      const conversation = await dataRepository.createConversation(uid, {
+        title: title.trim(),
+        platformOrigin,
+        locale,
+      });
+      res.status(201).json({ conversation });
     } catch (err) {
       next(err);
     }
@@ -149,6 +173,35 @@ apiRouter.get(
   }
 );
 
+apiRouter.post(
+  '/conversations/:conversationId/messages',
+  requireUserScopedAuth,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const uid = req.userContext!.uid;
+      const conversationId = String(req.params.conversationId);
+      const { role = 'user', content, modelUsed, locale = 'en-US' } = req.body;
+      if (!content || typeof content !== 'string' || !content.trim()) {
+        throw new ValidationError('Message content is required.');
+      }
+      if (role !== 'user' && role !== 'model' && role !== 'system') {
+        throw new ValidationError('Invalid message role.');
+      }
+
+      const message = await dataRepository.appendMessage(uid, {
+        conversationId,
+        role,
+        content: content.trim(),
+        modelUsed: modelUsed ? String(modelUsed) : undefined,
+        locale,
+      });
+      res.status(201).json({ message });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 // ----------------------------------------------------------------------------
 // 4. User-Scoped Long-Term Memories
 // ----------------------------------------------------------------------------
@@ -158,9 +211,10 @@ apiRouter.get(
   async (req: Request, res: Response<MemoriesListResponse>, next: NextFunction) => {
     try {
       const fbDiag = getFirebaseConfigurationStatus();
-      if (!fbDiag.configured || !req.userContext) {
+      const isConfigured = dataRepository.isConfigured();
+      if (!isConfigured || !req.userContext) {
         res.json({
-          configured: fbDiag.configured,
+          configured: isConfigured,
           memories: [],
           persistence: fbDiag,
         });
@@ -243,9 +297,10 @@ apiRouter.get(
   async (req: Request, res: Response<TasksListResponse>, next: NextFunction) => {
     try {
       const fbDiag = getFirebaseConfigurationStatus();
-      if (!fbDiag.configured || !req.userContext) {
+      const isConfigured = dataRepository.isConfigured();
+      if (!isConfigured || !req.userContext) {
         res.json({
-          configured: fbDiag.configured,
+          configured: isConfigured,
           tasks: [],
           persistence: fbDiag,
         });
@@ -366,9 +421,10 @@ apiRouter.get(
   async (req: Request, res: Response<WorkflowsListResponse>, next: NextFunction) => {
     try {
       const fbDiag = getFirebaseConfigurationStatus();
-      if (!fbDiag.configured || !req.userContext) {
+      const isConfigured = dataRepository.isConfigured();
+      if (!isConfigured || !req.userContext) {
         res.json({
-          configured: fbDiag.configured,
+          configured: isConfigured,
           workflows: [],
           persistence: fbDiag,
         });
@@ -392,9 +448,10 @@ apiRouter.get(
   async (req: Request, res: Response<AuditLogsListResponse>, next: NextFunction) => {
     try {
       const fbDiag = getFirebaseConfigurationStatus();
-      if (!fbDiag.configured || !req.userContext) {
+      const isConfigured = dataRepository.isConfigured();
+      if (!isConfigured || !req.userContext) {
         res.json({
-          configured: fbDiag.configured,
+          configured: isConfigured,
           auditLogs: [],
           persistence: fbDiag,
         });
